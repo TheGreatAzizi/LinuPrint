@@ -24,7 +24,7 @@ if [ "$pkgver" != "$VERSION" ]; then
 fi
 
 useradd -m builder
-chown -R builder /tmp/build /out
+chown -R builder /tmp/build
 
 if ! su builder -c 'cd /tmp/build/packaging && makepkg --printsrcinfo' >/tmp/srcinfo; then
   echo 'Failed to generate .SRCINFO' >&2
