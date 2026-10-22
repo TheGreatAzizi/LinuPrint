@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=LinuPrint
+Name[fa]=LinuPrint — ویزارد چاپگر و اسکنر
+Comment=Printer and scanner setup wizard for Arch Linux
+Comment[fa]=راه‌اندازی گام‌به‌گام چاپگر و اسکنر در آرچ لینوکس
+Exec=linuprint gui
+Icon=linuprint
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=printer;scanner;cups;sane;arch;print;scan;linuprint;
+StartupNotify=true

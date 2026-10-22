@@ -1,0 +1,23 @@
+[package]
+name = "linuprint"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+description = "Printer and scanner setup wizard for Arch-based Linux"
+license = "MIT"
+repository = "https://github.com/TheGreatAzizi/LinuPrint"
+homepage = "https://github.com/TheGreatAzizi/LinuPrint"
+keywords = ["arch", "cups", "sane", "printer", "scanner"]
+categories = ["command-line-utilities", "hardware-support"]
+
+[features]
+default = []
+gui = ["dep:gtk4"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+gtk4 = { version = "0.11", optional = true }
+
+[profile.release]
+lto = "thin"
+strip = true

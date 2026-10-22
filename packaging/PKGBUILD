@@ -1,0 +1,47 @@
+# Maintainer: Mohammad Mehdi Azizi <the.mmazizi@gmail.com>
+pkgname=linuprint
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Printer and scanner setup wizard for Arch Linux"
+arch=('x86_64' 'aarch64')
+url="https://github.com/TheGreatAzizi/LinuPrint"
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'glib2' 'gtk4' 'hicolor-icon-theme' 'cups' 'avahi' 'sane' 'polkit' 'xdg-utils')
+optdepends=(
+  'cups-filters: filters for some USB printers'
+  'nss-mdns: resolve .local mDNS printer names'
+  'sane-airscan: network eSCL and AirScan scanners'
+  'ipp-usb: driverless IPP printing over USB'
+  'hplip: HP printing and scanning'
+  'epson-inkjet-printer-escpr: Epson ESC/P-R printers'
+  'brlaser: Brother laser printers'
+  'gutenprint: generic printer drivers'
+)
+makedepends=('cargo' 'pkgconf' 'git')
+source=("git+https://github.com/TheGreatAzizi/LinuPrint.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$srcdir/LinuPrint"
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "$srcdir/LinuPrint"
+  cargo build --release --frozen --features gui
+}
+
+check() {
+  cd "$srcdir/LinuPrint"
+  cargo test --frozen
+}
+
+package() {
+  cd "$srcdir/LinuPrint"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 packaging/linuprint.desktop \
+    "$pkgdir/usr/share/applications/linuprint.desktop"
+  install -Dm644 packaging/linuprint.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/linuprint.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
