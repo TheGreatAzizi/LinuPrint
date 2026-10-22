@@ -65,7 +65,7 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd dist
-          sha256sum *.pkg.tar.zst > SHA256SUMS
+          sha256sum ./*.pkg.tar.zst > SHA256SUMS
           cat SHA256SUMS
 
       - name: Upload build artifact
