@@ -1,6 +1,6 @@
 # Maintainer: Mohammad Mehdi Azizi <the.mmazizi@gmail.com>
 pkgname=linuprint
-pkgver=0.1.1
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Printer and scanner setup wizard for Arch Linux"
 arch=('x86_64' 'aarch64')

@@ -4,8 +4,8 @@ use linuprint::backend::avahi::parse_avahi;
 use linuprint::backend::diagnostics::nsswitch_has_mdns;
 use linuprint::backend::drivers::{recommend_print_package, recommend_scanner_package};
 use linuprint::backend::printers::{
-    friendly_name_from_uri, parse_lpinfo, parse_lpinfo_models, parse_lpstat, select_model,
-    suggest_queue_name, uri_supports_driverless, validate_queue_name,
+    friendly_name_from_uri, parse_jobs, parse_lpinfo, parse_lpinfo_models, parse_lpstat,
+    select_model, suggest_queue_name, uri_supports_driverless, validate_queue_name,
 };
 use linuprint::backend::scanners::parse_scanimage;
 
@@ -49,6 +49,21 @@ fn parses_avahi_with_escapes_and_prefers_ipps() {
     assert!(printers
         .iter()
         .any(|printer| printer.name == "Brother HL-L2350DW"));
+}
+
+#[test]
+fn parses_print_jobs_and_ignores_duplicates() {
+    let output = "\
+hp-laserjet-1320-42 azizi 1024 Fri 23 Oct 2026 01:22:33 AM CET
+office-printer-7 guest 2048 Fri 23 Oct 2026 02:00:00 AM CET
+hp-laserjet-1320-42 azizi 1024 Fri 23 Oct 2026 01:22:33 AM CET
+";
+    let jobs = parse_jobs(output);
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].queue, "hp-laserjet-1320");
+    assert_eq!(jobs[0].submitted, "Fri 23 Oct 2026 01:22:33 AM CET");
+    assert_eq!(jobs[1].queue, "office-printer");
+    assert_eq!(jobs[1].user, "guest");
 }
 
 #[test]

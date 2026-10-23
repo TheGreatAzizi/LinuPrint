@@ -12,13 +12,18 @@ use crate::backend::packages::{
     aur_helper, enable_services, install_base_packages, install_packages,
 };
 use crate::backend::printers::{
-    discover_printers, list_queues, provision_printer, test_print, DiscoveredPrinter,
-    InstalledPrinter, PrinterOrigin, PrinterTransport,
+    cancel_all_jobs, cancel_job, discover_printers, list_jobs, list_queues, print_file,
+    provision_printer, set_default_printer, set_queue_enabled, test_print, DiscoveredPrinter,
+    InstalledPrinter, PrintJob, PrintOptions, PrinterOrigin, PrinterTransport,
 };
-use crate::backend::scanners::{default_scan_path, discover_scanners, run_test_scan, Scanner};
+use crate::backend::scanners::{
+    default_scan_path, discover_scanners, run_scan, save_scan, ScanColorMode, ScanFormat,
+    ScanOptions, Scanner,
+};
 use crate::backend::shell::SystemRunner;
 
-const STEP_NAMES: [&str; 4] = ["diagnostics", "printers", "scanners", "finish"];
+const STEP_NAMES: [&str; 5] = ["diagnostics", "printers", "print", "scanners", "finish"];
+const PROJECT_URL: &str = "https://github.com/TheGreatAzizi/LinuPrint";
 
 #[derive(Clone)]
 struct UiState {
@@ -78,6 +83,25 @@ where
     });
 }
 
+fn open_project_page() {
+    let launcher = gtk::UriLauncher::new(PROJECT_URL);
+    launcher.launch(
+        None::<&gtk::Window>,
+        None::<&gtk::gio::Cancellable>,
+        |result| {
+            if let Err(error) = result {
+                let dialog = gtk::AlertDialog::builder()
+                    .message("باز کردن صفحه پروژه ناموفق بود")
+                    .detail(format!(
+                        "مرورگر پیش‌فرض باز نشد. نشانی پروژه را دستی باز کنید:\n{PROJECT_URL}\n\n{error}"
+                    ))
+                    .build();
+                dialog.show(None::<&gtk::Window>);
+            }
+        },
+    );
+}
+
 pub fn run() {
     let app = gtk::Application::builder()
         .application_id("io.github.thegreatazizi.linuprint")
@@ -97,6 +121,7 @@ fn build_ui(app: &gtk::Application) {
         .build();
     stack.add_named(&build_diagnostics_page(), Some("diagnostics"));
     stack.add_named(&build_printer_page(&state), Some("printers"));
+    stack.add_named(&build_print_page(), Some("print"));
     stack.add_named(&build_scanner_page(&state), Some("scanners"));
     stack.add_named(&build_finish_page(), Some("finish"));
 
@@ -150,6 +175,11 @@ fn build_ui(app: &gtk::Application) {
     let title = gtk::Label::new(Some("LinuPrint — ویزارد چاپگر و اسکنر"));
     title.add_css_class("title");
     header.set_title_widget(Some(&title));
+
+    let project_button = gtk::Button::with_label("GitHub");
+    project_button.set_tooltip_text(Some("باز کردن مخزن LinuPrint در مرورگر"));
+    project_button.connect_clicked(|_| open_project_page());
+    header.pack_end(&project_button);
 
     let window = gtk::ApplicationWindow::builder()
         .application(app)
@@ -977,9 +1007,512 @@ fn test_print_async(button: &gtk::Button, status: &gtk::Label, queue: String) {
     );
 }
 
+fn build_print_page() -> gtk::Widget {
+    let (page, content) = titled_page(
+        "۳. چاپ و مدیریت صف",
+        "فایل را به صف انتخابی بفرستید، گزینه‌های چاپ را تعیین کنید و کارهای در انتظار را مدیریت کنید.",
+    );
+
+    let queue_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let queue_label = gtk::Label::new(Some("صف چاپ:"));
+    queue_label.add_css_class("dim-label");
+    let queue_dropdown = gtk::DropDown::from_strings(&["در حال بارگذاری..."]);
+    queue_dropdown.set_hexpand(true);
+    let queue_refresh = gtk::Button::with_label("به‌روزرسانی صف‌ها");
+    queue_row.append(&queue_label);
+    queue_row.append(&queue_dropdown);
+    queue_row.append(&queue_refresh);
+    content.append(&queue_row);
+
+    let manage_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let default_button = gtk::Button::with_label("پیش‌فرض");
+    let pause_button = gtk::Button::with_label("توقف صف");
+    let resume_button = gtk::Button::with_label("ادامه صف");
+    manage_row.append(&default_button);
+    manage_row.append(&pause_button);
+    manage_row.append(&resume_button);
+    content.append(&manage_row);
+
+    let status = gtk::Label::new(None);
+    status.set_halign(gtk::Align::Start);
+    status.set_wrap(true);
+    status.add_css_class("dim-label");
+    content.append(&status);
+
+    let file_title = gtk::Label::new(Some("چاپ فایل"));
+    file_title.add_css_class("heading");
+    file_title.set_halign(gtk::Align::Start);
+    content.append(&file_title);
+
+    let file_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let file_entry = gtk::Entry::builder()
+        .hexpand(true)
+        .placeholder_text("مسیر فایل PDF، تصویر یا متن")
+        .build();
+    let choose_file = gtk::Button::with_label("انتخاب فایل...");
+    file_row.append(&file_entry);
+    file_row.append(&choose_file);
+    content.append(&file_row);
+
+    let options = gtk::Grid::builder()
+        .column_spacing(8)
+        .row_spacing(8)
+        .build();
+    let copies_label = gtk::Label::builder()
+        .label("تعداد نسخه:")
+        .halign(gtk::Align::Start)
+        .build();
+    let copies = gtk::SpinButton::with_range(1.0, 99.0, 1.0);
+    copies.set_value(1.0);
+    copies.set_numeric(true);
+    let pages_label = gtk::Label::builder()
+        .label("صفحات:")
+        .halign(gtk::Align::Start)
+        .build();
+    let pages_entry = gtk::Entry::builder().placeholder_text("مثلاً 1-3,5").build();
+    let duplex = gtk::CheckButton::with_label("چاپ دوطرفه");
+    let fit = gtk::CheckButton::with_label("تناسب با صفحه");
+    fit.set_active(true);
+    let media_label = gtk::Label::builder()
+        .label("اندازه کاغذ:")
+        .halign(gtk::Align::Start)
+        .build();
+    let media = gtk::DropDown::from_strings(&["خودکار", "A4", "Letter"]);
+    options.attach(&copies_label, 0, 0, 1, 1);
+    options.attach(&copies, 1, 0, 1, 1);
+    options.attach(&pages_label, 2, 0, 1, 1);
+    options.attach(&pages_entry, 3, 0, 1, 1);
+    options.attach(&duplex, 0, 1, 2, 1);
+    options.attach(&fit, 2, 1, 2, 1);
+    options.attach(&media_label, 0, 2, 1, 1);
+    options.attach(&media, 1, 2, 3, 1);
+    content.append(&options);
+
+    let print_button = gtk::Button::with_label("ارسال به چاپ");
+    content.append(&print_button);
+
+    let jobs_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let jobs_title = gtk::Label::new(Some("کارهای در صف"));
+    jobs_title.add_css_class("heading");
+    jobs_title.set_halign(gtk::Align::Start);
+    jobs_title.set_hexpand(true);
+    let jobs_refresh = gtk::Button::with_label("به‌روزرسانی");
+    let cancel_all = gtk::Button::with_label("لغو همه");
+    jobs_header.append(&jobs_title);
+    jobs_header.append(&jobs_refresh);
+    jobs_header.append(&cancel_all);
+    content.append(&jobs_header);
+
+    let jobs_list = gtk::ListBox::new();
+    jobs_list.set_selection_mode(gtk::SelectionMode::None);
+    let jobs_scroller = gtk::ScrolledWindow::builder()
+        .min_content_height(120)
+        .max_content_height(240)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .child(&jobs_list)
+        .build();
+    content.append(&jobs_scroller);
+
+    let queues = Rc::new(RefCell::new(Vec::new()));
+    refresh_print_queues(&queue_dropdown, &queues, &status);
+    refresh_print_jobs(&jobs_list, &status);
+
+    {
+        let dropdown = queue_dropdown.clone();
+        let queues = queues.clone();
+        let status = status.clone();
+        let list = jobs_list.clone();
+        page.connect_map(move |_| {
+            refresh_print_queues(&dropdown, &queues, &status);
+            refresh_print_jobs(&list, &status);
+        });
+    }
+
+    {
+        let entry = file_entry.clone();
+        choose_file.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::builder()
+                .title("انتخاب فایل برای چاپ")
+                .build();
+            let entry = entry.clone();
+            dialog.open(
+                None::<&gtk::Window>,
+                None::<&gtk::gio::Cancellable>,
+                move |result| {
+                    if let Ok(file) = result {
+                        if let Some(path) = file.path() {
+                            entry.set_text(&path.to_string_lossy());
+                        }
+                    }
+                },
+            );
+        });
+    }
+
+    {
+        let queues = queues.clone();
+        let queue_dropdown = queue_dropdown.clone();
+        let status = status.clone();
+        queue_refresh.connect_clicked(move |_| {
+            refresh_print_queues(&queue_dropdown, &queues, &status);
+        });
+    }
+
+    {
+        let queues = queues.clone();
+        let queue_dropdown = queue_dropdown.clone();
+        let status = status.clone();
+        let button = default_button.clone();
+        default_button.connect_clicked(move |_| {
+            let queues = queues.clone();
+            let queue_dropdown = queue_dropdown.clone();
+            let status = status.clone();
+            let button = button.clone();
+            queue_action_async(&button, &status, queues, queue_dropdown, |runner, queue| {
+                set_default_printer(runner, queue, true)
+            });
+        });
+    }
+
+    {
+        let queues = queues.clone();
+        let queue_dropdown = queue_dropdown.clone();
+        let status = status.clone();
+        let button = pause_button.clone();
+        pause_button.connect_clicked(move |_| {
+            let queues = queues.clone();
+            let queue_dropdown = queue_dropdown.clone();
+            let status = status.clone();
+            let button = button.clone();
+            queue_action_async(&button, &status, queues, queue_dropdown, |runner, queue| {
+                set_queue_enabled(runner, queue, false, true)
+            });
+        });
+    }
+
+    {
+        let queues = queues.clone();
+        let queue_dropdown = queue_dropdown.clone();
+        let status = status.clone();
+        let button = resume_button.clone();
+        resume_button.connect_clicked(move |_| {
+            let queues = queues.clone();
+            let queue_dropdown = queue_dropdown.clone();
+            let status = status.clone();
+            let button = button.clone();
+            queue_action_async(&button, &status, queues, queue_dropdown, |runner, queue| {
+                set_queue_enabled(runner, queue, true, true)
+            });
+        });
+    }
+
+    {
+        let queues = queues.clone();
+        let queue_dropdown = queue_dropdown.clone();
+        let file_entry = file_entry.clone();
+        let pages_entry = pages_entry.clone();
+        let copies = copies.clone();
+        let duplex = duplex.clone();
+        let fit = fit.clone();
+        let media = media.clone();
+        let jobs_list = jobs_list.clone();
+        let status = status.clone();
+        let print_widget = print_button.clone();
+        print_button.connect_clicked(move |_| {
+            let Some(queue) = selected_print_queue(&queues, &queue_dropdown) else {
+                set_status(
+                    &status,
+                    "اول یک صف چاپ را انتخاب یا اضافه کنید.",
+                    Some("warning"),
+                );
+                return;
+            };
+            let file_text = file_entry.text().trim().to_string();
+            if file_text.is_empty() {
+                set_status(&status, "مسیر فایل را انتخاب کنید.", Some("warning"));
+                return;
+            }
+            let pages = pages_entry.text().trim().to_string();
+            let media = match media.selected() {
+                1 => Some("A4".to_string()),
+                2 => Some("Letter".to_string()),
+                _ => None,
+            };
+            let options = PrintOptions {
+                copies: copies.value() as u32,
+                pages: (!pages.is_empty()).then_some(pages),
+                duplex: duplex.is_active(),
+                fit_to_page: fit.is_active(),
+                media,
+            };
+            let file = PathBuf::from(file_text);
+
+            print_widget.set_sensitive(false);
+            set_status(&status, "در حال ارسال فایل به صف چاپ...", None);
+            let button = print_widget.clone();
+            let status = status.clone();
+            let jobs_list = jobs_list.clone();
+            run_background(
+                move || print_file(&SystemRunner, &queue, &file, &options),
+                move |result| {
+                    button.set_sensitive(true);
+                    match result {
+                        Ok(message) => {
+                            set_status(&status, &message, Some("success"));
+                            refresh_print_jobs(&jobs_list, &status);
+                        }
+                        Err(error) => set_status(&status, &error, Some("error")),
+                    }
+                },
+            );
+        });
+    }
+
+    {
+        let list = jobs_list.clone();
+        let status = status.clone();
+        jobs_refresh.connect_clicked(move |_| {
+            refresh_print_jobs(&list, &status);
+        });
+    }
+
+    {
+        let queues = queues.clone();
+        let queue_dropdown = queue_dropdown.clone();
+        let list = jobs_list.clone();
+        let status = status.clone();
+        cancel_all.connect_clicked(move |_| {
+            let Some(queue) = selected_print_queue(&queues, &queue_dropdown) else {
+                set_status(&status, "اول یک صف چاپ را انتخاب کنید.", Some("warning"));
+                return;
+            };
+            let dialog = gtk::AlertDialog::builder()
+                .message(format!("همه کارهای صف «{queue}» لغو شوند؟"))
+                .buttons(["انصراف", "لغو همه"])
+                .cancel_button(0)
+                .default_button(0)
+                .build();
+            let list = list.clone();
+            let status = status.clone();
+            dialog.choose(
+                None::<&gtk::Window>,
+                None::<&gtk::gio::Cancellable>,
+                move |response| {
+                    if !matches!(response, Ok(1)) {
+                        return;
+                    }
+                    let queue = queue.clone();
+                    let list = list.clone();
+                    let status = status.clone();
+                    set_status(&status, "در حال لغو کارهای صف...", None);
+                    run_background(
+                        move || cancel_all_jobs(&SystemRunner, &queue, true),
+                        move |result| match result {
+                            Ok(message) => {
+                                set_status(&status, &message, Some("success"));
+                                refresh_print_jobs(&list, &status);
+                            }
+                            Err(error) => set_status(&status, &error, Some("error")),
+                        },
+                    );
+                },
+            );
+        });
+    }
+
+    scroll_page(&page)
+}
+
+fn refresh_print_queues(
+    dropdown: &gtk::DropDown,
+    queues: &Rc<RefCell<Vec<InstalledPrinter>>>,
+    status: &gtk::Label,
+) {
+    let dropdown = dropdown.clone();
+    let queues = queues.clone();
+    let status = status.clone();
+    set_status(&status, "در حال خواندن صف‌های چاپ...", None);
+    run_background(
+        || list_queues(&SystemRunner),
+        move |result| match result {
+            Ok(items) => {
+                let model = gtk::StringList::new(&[]);
+                for queue in &items {
+                    model.append(&queue.name);
+                }
+                dropdown.set_model(Some(&model));
+                if items.is_empty() {
+                    set_status(
+                        &status,
+                        "هیچ صف چاپی وجود ندارد؛ اول چاپگر اضافه کنید.",
+                        Some("warning"),
+                    );
+                } else {
+                    dropdown.set_selected(0);
+                    set_status(
+                        &status,
+                        &format!("{} صف چاپ در دسترس است.", persian_number(items.len())),
+                        Some("success"),
+                    );
+                }
+                *queues.borrow_mut() = items;
+            }
+            Err(error) => set_status(&status, &error, Some("error")),
+        },
+    );
+}
+
+fn refresh_print_jobs(list: &gtk::ListBox, status: &gtk::Label) {
+    let list = list.clone();
+    let status = status.clone();
+    run_background(
+        || list_jobs(&SystemRunner, None),
+        move |result| render_print_jobs(&list, &status, result),
+    );
+}
+
+fn render_print_jobs(
+    list: &gtk::ListBox,
+    status: &gtk::Label,
+    result: Result<Vec<PrintJob>, String>,
+) {
+    clear_list(list);
+    match result {
+        Ok(jobs) if jobs.is_empty() => {
+            let row = gtk::ListBoxRow::new();
+            row.set_activatable(false);
+            let label = gtk::Label::builder()
+                .label("هیچ کاری در صف نیست.")
+                .halign(gtk::Align::Start)
+                .build();
+            label.add_css_class("dim-label");
+            label.set_margin_top(8);
+            label.set_margin_bottom(8);
+            label.set_margin_start(8);
+            label.set_margin_end(8);
+            row.set_child(Some(&label));
+            list.append(&row);
+        }
+        Ok(jobs) => {
+            for job in jobs {
+                let row = gtk::ListBoxRow::new();
+                row.set_activatable(false);
+
+                let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                line.set_margin_top(6);
+                line.set_margin_bottom(6);
+                line.set_margin_start(8);
+                line.set_margin_end(8);
+
+                let details = gtk::Label::builder()
+                    .label(format!(
+                        "{} · صف {} · کاربر {} · {} · {}",
+                        job.id, job.queue, job.user, job.size, job.submitted
+                    ))
+                    .halign(gtk::Align::Start)
+                    .hexpand(true)
+                    .wrap(true)
+                    .build();
+                let cancel = gtk::Button::with_label("لغو");
+                {
+                    let job_id = job.id.clone();
+                    let list = list.clone();
+                    let status = status.clone();
+                    let button = cancel.clone();
+                    cancel.connect_clicked(move |_| {
+                        let job_id = job_id.clone();
+                        let list = list.clone();
+                        let status = status.clone();
+                        button.set_sensitive(false);
+                        set_status(&status, &format!("در حال لغو کار «{job_id}»..."), None);
+                        let cancel_button = button.clone();
+                        run_background(
+                            move || cancel_job(&SystemRunner, &job_id),
+                            move |result| {
+                                cancel_button.set_sensitive(true);
+                                match result {
+                                    Ok(message) => {
+                                        set_status(&status, &message, Some("success"));
+                                        refresh_print_jobs(&list, &status);
+                                    }
+                                    Err(error) => set_status(&status, &error, Some("error")),
+                                }
+                            },
+                        );
+                    });
+                }
+                line.append(&details);
+                line.append(&cancel);
+                row.set_child(Some(&line));
+                list.append(&row);
+            }
+        }
+        Err(error) => {
+            let row = gtk::ListBoxRow::new();
+            row.set_activatable(false);
+            let label = gtk::Label::builder()
+                .label(&error)
+                .halign(gtk::Align::Start)
+                .wrap(true)
+                .build();
+            label.add_css_class("error");
+            label.set_margin_top(8);
+            label.set_margin_bottom(8);
+            label.set_margin_start(8);
+            label.set_margin_end(8);
+            row.set_child(Some(&label));
+            list.append(&row);
+        }
+    }
+}
+
+fn selected_print_queue(
+    queues: &Rc<RefCell<Vec<InstalledPrinter>>>,
+    dropdown: &gtk::DropDown,
+) -> Option<String> {
+    let index = usize::try_from(dropdown.selected()).ok()?;
+    queues.borrow().get(index).map(|queue| queue.name.clone())
+}
+
+fn queue_action_async<F>(
+    button: &gtk::Button,
+    status: &gtk::Label,
+    queues: Rc<RefCell<Vec<InstalledPrinter>>>,
+    dropdown: gtk::DropDown,
+    action: F,
+) where
+    F: FnOnce(&SystemRunner, &str) -> Result<String, String> + Send + 'static,
+{
+    let Some(queue) = selected_print_queue(&queues, &dropdown) else {
+        set_status(status, "اول یک صف چاپ را انتخاب کنید.", Some("warning"));
+        return;
+    };
+    let button = button.clone();
+    let status = status.clone();
+    button.set_sensitive(false);
+    set_status(&status, "در حال انجام عملیات روی صف...", None);
+    run_background(
+        move || action(&SystemRunner, &queue),
+        move |result| {
+            button.set_sensitive(true);
+            match result {
+                Ok(message) => set_status(&status, &message, Some("success")),
+                Err(error) => set_status(&status, &error, Some("error")),
+            }
+        },
+    );
+}
+
+fn clear_list(list: &gtk::ListBox) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+}
+
 fn build_scanner_page(state: &UiState) -> gtk::Widget {
     let (page, content) = titled_page(
-        "۳. اسکنر",
+        "۴. اسکنر",
         "اسکنرهای USB و شبکه با SANE شناسایی می‌شوند. برای اسکنرهای شبکه eSCL نصب sane-airscan توصیه می‌شود.",
     );
 
@@ -1026,15 +1559,33 @@ fn build_scanner_page(state: &UiState) -> gtk::Widget {
     resolution_row.append(&resolution);
     content.append(&resolution_row);
 
+    let format_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let format_label = gtk::Label::new(Some("قالب فایل:"));
+    format_label.add_css_class("dim-label");
+    let format = gtk::DropDown::from_strings(&["PNG", "JPEG", "PDF"]);
+    format.set_selected(0);
+    let mode_label = gtk::Label::new(Some("حالت رنگ:"));
+    mode_label.add_css_class("dim-label");
+    let mode = gtk::DropDown::from_strings(&["خودکار", "رنگی", "خاکستری", "سیاه‌وسفید"]);
+    mode.set_selected(0);
+    format_row.append(&format_label);
+    format_row.append(&format);
+    format_row.append(&mode_label);
+    format_row.append(&mode);
+    content.append(&format_row);
+
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let install_button = gtk::Button::with_label("نصب بسته پیشنهادی");
     install_button.set_sensitive(false);
-    let scan_button = gtk::Button::with_label("اسکن آزمایشی");
+    let scan_button = gtk::Button::with_label("اسکن و ذخیره");
     scan_button.set_sensitive(false);
+    let save_button = gtk::Button::with_label("ذخیره در...");
+    save_button.set_sensitive(false);
     let open_button = gtk::Button::with_label("نمایش فایل");
     open_button.set_sensitive(false);
     actions.append(&install_button);
     actions.append(&scan_button);
+    actions.append(&save_button);
     actions.append(&open_button);
     content.append(&actions);
 
@@ -1203,8 +1754,11 @@ fn build_scanner_page(state: &UiState) -> gtk::Widget {
     {
         let state = state.clone();
         let status = status.clone();
+        let save_button = save_button.clone();
         let open_button = open_button.clone();
         let scan_widget = scan_button.clone();
+        let format = format.clone();
+        let mode = mode.clone();
         scan_button.connect_clicked(move |_| {
             let Some(index) = state.selected_scanner.get() else {
                 set_status(
@@ -1222,35 +1776,97 @@ fn build_scanner_page(state: &UiState) -> gtk::Widget {
                 );
                 return;
             };
-            let output = default_scan_path();
+            let scan_format = match format.selected() {
+                1 => ScanFormat::Jpeg,
+                2 => ScanFormat::Pdf,
+                _ => ScanFormat::Png,
+            };
+            let color_mode = match mode.selected() {
+                1 => ScanColorMode::Color,
+                2 => ScanColorMode::Gray,
+                3 => ScanColorMode::Lineart,
+                _ => ScanColorMode::Auto,
+            };
+            let output = default_scan_path(scan_format);
             let resolution = match resolution.selected() {
                 0 => 75,
                 2 => 300,
                 3 => 600,
                 _ => 150,
             };
+            let options = ScanOptions {
+                resolution,
+                format: scan_format,
+                color_mode,
+            };
             scan_widget.set_sensitive(false);
-            set_status(&status, "در حال اسکن آزمایشی...", None);
+            set_status(&status, "در حال اسکن...", None);
 
             let output_message = output.clone();
             let device = scanner.device;
             let status = status.clone();
             let scan_widget = scan_widget.clone();
+            let save_button = save_button.clone();
             let open_button = open_button.clone();
             let state = state.clone();
             run_background(
-                move || run_test_scan(&SystemRunner, &device, &output, resolution),
+                move || run_scan(&SystemRunner, &device, &output, &options),
                 move |result| {
                     scan_widget.set_sensitive(state.selected_scanner.get().is_some());
                     match result {
                         Ok(message) => {
                             *state.scan_output.borrow_mut() = Some(output_message.clone());
+                            save_button.set_sensitive(true);
                             open_button.set_sensitive(true);
                             set_status(
                                 &status,
                                 &format!("{message} فایل: {}", output_message.display()),
                                 Some("success"),
                             );
+                        }
+                        Err(error) => set_status(&status, &error, Some("error")),
+                    }
+                },
+            );
+        });
+    }
+
+    {
+        let state = state.clone();
+        let status = status.clone();
+        let open_button = open_button.clone();
+        save_button.connect_clicked(move |_| {
+            let Some(source) = state.scan_output.borrow().clone() else {
+                set_status(&status, "اول یک اسکن انجام دهید.", Some("warning"));
+                return;
+            };
+            let initial_name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("linuprint-scan.png")
+                .to_string();
+            let dialog = gtk::FileDialog::builder()
+                .title("ذخیره اسکن")
+                .initial_name(initial_name)
+                .build();
+            let state = state.clone();
+            let status = status.clone();
+            let open_button = open_button.clone();
+            dialog.save(
+                None::<&gtk::Window>,
+                None::<&gtk::gio::Cancellable>,
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(destination) = file.path() else {
+                        return;
+                    };
+                    match save_scan(&source, &destination) {
+                        Ok(message) => {
+                            *state.scan_output.borrow_mut() = Some(destination.clone());
+                            open_button.set_sensitive(true);
+                            set_status(&status, &message, Some("success"));
                         }
                         Err(error) => set_status(&status, &error, Some("error")),
                     }
@@ -1318,8 +1934,8 @@ fn scanner_row(scanner: &Scanner) -> gtk::ListBoxRow {
 
 fn build_finish_page() -> gtk::Widget {
     let (page, content) = titled_page(
-        "۴. پایان",
-        "اگر چاپ آزمایشی و اسکن آزمایشی موفق بود، تنظیمات کامل است.",
+        "۵. پایان",
+        "اگر چاپ آزمایشی و اسکن آزمایشی موفق بود، تنظیمات کامل است. از صفحه چاپ می‌توانید فایل بفرستید و صف را مدیریت کنید.",
     );
 
     let tips_heading = gtk::Label::builder()
@@ -1334,6 +1950,7 @@ fn build_finish_page() -> gtk::Widget {
         "اگر چاپگر پیدا نشد، سرویس cups.socket و باز بودن UDP 5353 برای mDNS را بررسی کنید.",
         "اگر اسکنر دسترسی نداشت، عضو گروه‌های scanner و lp شوید و دوباره وارد شوید.",
         "درایورهای AUR را با paru یا yay نصب کنید؛ ویزارد آن‌ها را خودکار نصب نمی‌کند.",
+        "چاپ فایل و مدیریت کارها از CLI: linuprint printers print و linuprint printers jobs",
         "گزارش کامل وضعیت با دستور linuprint diagnose نمایش داده می‌شود.",
     ];
     for tip in tip_items {

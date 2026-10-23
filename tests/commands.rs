@@ -2,8 +2,13 @@ mod support;
 
 use std::path::Path;
 
-use linuprint::backend::printers::{add_printer_command, provision_printer};
-use linuprint::backend::scanners::test_scan_command;
+use linuprint::backend::printers::{
+    add_printer_command, list_jobs, print_file_command, provision_printer, test_page_pdf,
+    PrintOptions,
+};
+use linuprint::backend::scanners::{
+    scan_command, test_scan_command, ScanColorMode, ScanFormat, ScanOptions,
+};
 use linuprint::backend::shell::{wrap_privileged, Cmd, PrivilegeTools};
 
 use support::{failure, success, FakeRunner};
@@ -220,4 +225,139 @@ fn builds_scanimage_command() {
     assert!(test_scan_command("-bad", Path::new("/tmp/scan.png"), 150).is_err());
     assert!(test_scan_command("dev", Path::new("/tmp/scan.png"), 10).is_err());
     assert!(test_scan_command("dev", Path::new("/tmp/scan.png"), 5000).is_err());
+}
+
+#[test]
+fn builds_print_file_command_with_options() {
+    let options = PrintOptions {
+        copies: 2,
+        pages: Some("1-3,5".to_string()),
+        duplex: true,
+        fit_to_page: true,
+        media: Some("A4".to_string()),
+    };
+    let cmd =
+        print_file_command("hp-laserjet-1320", Path::new("/tmp/report.pdf"), &options).unwrap();
+
+    assert_eq!(cmd.program, "lp");
+    assert_eq!(
+        cmd.args.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec![
+            "-d",
+            "hp-laserjet-1320",
+            "-n",
+            "2",
+            "-o",
+            "sides=two-sided-long-edge",
+            "-o",
+            "fit-to-page",
+            "-o",
+            "page-ranges=1-3,5",
+            "-o",
+            "media=A4",
+            "/tmp/report.pdf"
+        ]
+    );
+}
+
+#[test]
+fn rejects_invalid_print_options() {
+    let base = PrintOptions::default();
+    assert!(print_file_command(
+        "hp",
+        Path::new("/tmp/report.pdf"),
+        &PrintOptions {
+            copies: 0,
+            ..base.clone()
+        }
+    )
+    .is_err());
+    assert!(print_file_command(
+        "hp",
+        Path::new("/tmp/report.pdf"),
+        &PrintOptions {
+            pages: Some("3-1".to_string()),
+            ..base.clone()
+        }
+    )
+    .is_err());
+    assert!(print_file_command(
+        "hp",
+        Path::new("/tmp/report.pdf"),
+        &PrintOptions {
+            pages: Some("1,,2".to_string()),
+            ..base.clone()
+        }
+    )
+    .is_err());
+    assert!(print_file_command(
+        "hp",
+        Path::new("/tmp/report.pdf"),
+        &PrintOptions {
+            media: Some("-bad".to_string()),
+            ..base
+        }
+    )
+    .is_err());
+}
+
+#[test]
+fn builds_colored_jpeg_scanimage_command() {
+    let options = ScanOptions {
+        resolution: 300,
+        format: ScanFormat::Jpeg,
+        color_mode: ScanColorMode::Color,
+    };
+    let cmd = scan_command(
+        "escl:http://scanner.local",
+        Path::new("/tmp/scan.jpg"),
+        &options,
+    )
+    .unwrap();
+
+    assert_eq!(
+        cmd.args.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec![
+            "-d",
+            "escl:http://scanner.local",
+            "--format=jpeg",
+            "--resolution=300",
+            "--mode=Color",
+            "-o",
+            "/tmp/scan.jpg"
+        ]
+    );
+}
+
+#[test]
+fn builds_valid_test_page_pdf() {
+    let bytes = test_page_pdf("hp-laserjet-1320");
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(text.starts_with("%PDF-1.4"));
+    assert!(text.contains("LinuPrint Test Page"));
+    assert!(text.contains("Queue: hp-laserjet-1320"));
+    assert!(text.contains("If you can read this page, printing is working."));
+    assert!(text.ends_with("%%EOF\n"));
+
+    let startxref_marker = "startxref\n";
+    let start = text.rfind(startxref_marker).unwrap() + startxref_marker.len();
+    let end = text[start..].find('\n').unwrap() + start;
+    let offset: usize = text[start..end].parse().unwrap();
+    assert!(bytes[offset..].starts_with(b"xref\n"));
+}
+
+#[test]
+fn lists_jobs_for_selected_queue() {
+    let mut runner = FakeRunner::with_tools(&["lpstat"]);
+    runner.on(
+        "lpstat -o hp-laserjet-1320",
+        success("hp-laserjet-1320-42 azizi 1024 Fri 23 Oct 2026 01:22:33 AM CET\n"),
+    );
+
+    let jobs = list_jobs(&runner, Some("hp-laserjet-1320")).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, "hp-laserjet-1320-42");
+    assert_eq!(jobs[0].queue, "hp-laserjet-1320");
+    assert_eq!(jobs[0].user, "azizi");
+    assert_eq!(jobs[0].size, "1024");
 }

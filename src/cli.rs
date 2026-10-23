@@ -1,16 +1,19 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::backend::diagnostics::{format_report, run_diagnostics, CheckState};
 use crate::backend::drivers::{recommend_print_package, recommend_scanner_package};
 use crate::backend::packages::{enable_services, install_packages};
 use crate::backend::printers::{
-    discover_printers, friendly_name_from_uri, list_queues, provision_printer, remove_printer,
-    test_print, PrinterOrigin, PrinterTransport,
+    cancel_all_jobs, cancel_job, discover_printers, friendly_name_from_uri, list_jobs, list_queues,
+    print_file, provision_printer, remove_printer, set_default_printer, set_queue_enabled,
+    test_print, PrintOptions, PrinterOrigin, PrinterTransport,
 };
-use crate::backend::scanners::{discover_scanners, run_test_scan};
+use crate::backend::scanners::{
+    default_scan_path, discover_scanners, run_scan, ScanColorMode, ScanFormat, ScanOptions,
+};
 use crate::backend::shell::SystemRunner;
 
 #[derive(Debug, Parser)]
@@ -76,24 +79,103 @@ enum PrinterCommands {
     Test { queue: String },
     /// حذف صف چاپگر
     Remove { queue: String },
+    /// تنظیم چاپگر پیش‌فرض
+    Default { queue: String },
+    /// توقف موقت صف
+    Pause { queue: String },
+    /// فعال‌سازی دوباره صف
+    Resume { queue: String },
+    /// چاپ یک فایل
+    Print {
+        /// نام صف چاپ
+        queue: String,
+        /// مسیر فایل برای چاپ
+        file: PathBuf,
+        /// تعداد نسخه
+        #[arg(long, default_value_t = 1)]
+        copies: u32,
+        /// محدوده صفحات، مثلاً 1-3,5
+        #[arg(long)]
+        pages: Option<String>,
+        /// چاپ دوطرفه
+        #[arg(long)]
+        duplex: bool,
+        /// تناسب محتوا با اندازه صفحه
+        #[arg(long)]
+        fit: bool,
+        /// اندازه کاغذ، مثلاً A4 یا Letter
+        #[arg(long)]
+        media: Option<String>,
+    },
+    /// فهرست کارهای در صف
+    Jobs {
+        #[arg(long)]
+        queue: Option<String>,
+    },
+    /// لغو یک کار با شناسه
+    Cancel { job: String },
+    /// لغو همه کارهای یک صف
+    CancelAll { queue: String },
 }
 
 #[derive(Debug, Subcommand)]
 enum ScannerCommands {
     /// فهرست اسکنرهای شناسایی‌شده
     List,
-    /// اسکن آزمایشی
+    /// اسکن و ذخیره فایل
     Scan {
         /// شناسه دستگاه از خروجی scanners list
         #[arg(long)]
         device: String,
-        /// مسیر فایل PNG خروجی
+        /// مسیر فایل خروجی؛ پیش‌فرض در پوشه Documents
         #[arg(long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
         /// رزولوشن اسکن
         #[arg(long, default_value_t = 150)]
         resolution: u32,
+        /// قالب فایل خروجی
+        #[arg(long, value_enum, default_value = "png")]
+        format: ScanFormatArg,
+        /// حالت رنگ
+        #[arg(long, value_enum, default_value = "auto")]
+        mode: ScanModeArg,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ScanFormatArg {
+    Png,
+    Jpeg,
+    Pdf,
+}
+
+impl From<ScanFormatArg> for ScanFormat {
+    fn from(value: ScanFormatArg) -> Self {
+        match value {
+            ScanFormatArg::Png => Self::Png,
+            ScanFormatArg::Jpeg => Self::Jpeg,
+            ScanFormatArg::Pdf => Self::Pdf,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ScanModeArg {
+    Auto,
+    Color,
+    Gray,
+    Lineart,
+}
+
+impl From<ScanModeArg> for ScanColorMode {
+    fn from(value: ScanModeArg) -> Self {
+        match value {
+            ScanModeArg::Auto => Self::Auto,
+            ScanModeArg::Color => Self::Color,
+            ScanModeArg::Gray => Self::Gray,
+            ScanModeArg::Lineart => Self::Lineart,
+        }
+    }
 }
 
 pub fn run() -> ExitCode {
@@ -167,6 +249,49 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
                 println!("{}", remove_printer(&runner, &queue, false)?);
                 Ok(0)
             }
+            PrinterCommands::Default { queue } => {
+                println!("{}", set_default_printer(&runner, &queue, false)?);
+                Ok(0)
+            }
+            PrinterCommands::Pause { queue } => {
+                println!("{}", set_queue_enabled(&runner, &queue, false, false)?);
+                Ok(0)
+            }
+            PrinterCommands::Resume { queue } => {
+                println!("{}", set_queue_enabled(&runner, &queue, true, false)?);
+                Ok(0)
+            }
+            PrinterCommands::Print {
+                queue,
+                file,
+                copies,
+                pages,
+                duplex,
+                fit,
+                media,
+            } => {
+                let options = PrintOptions {
+                    copies,
+                    pages,
+                    duplex,
+                    fit_to_page: fit,
+                    media,
+                };
+                println!("{}", print_file(&runner, &queue, &file, &options)?);
+                Ok(0)
+            }
+            PrinterCommands::Jobs { queue } => {
+                print_jobs(queue.as_deref())?;
+                Ok(0)
+            }
+            PrinterCommands::Cancel { job } => {
+                println!("{}", cancel_job(&runner, &job)?);
+                Ok(0)
+            }
+            PrinterCommands::CancelAll { queue } => {
+                println!("{}", cancel_all_jobs(&runner, &queue, false)?);
+                Ok(0)
+            }
         },
         Commands::Scanners { command } => match command {
             ScannerCommands::List => {
@@ -177,8 +302,17 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
                 device,
                 output,
                 resolution,
+                format,
+                mode,
             } => {
-                println!("{}", run_test_scan(&runner, &device, &output, resolution)?);
+                let format = ScanFormat::from(format);
+                let output = output.unwrap_or_else(|| default_scan_path(format));
+                let options = ScanOptions {
+                    resolution,
+                    format,
+                    color_mode: mode.into(),
+                };
+                println!("{}", run_scan(&runner, &device, &output, &options)?);
                 println!("فایل: {}", output.display());
                 Ok(0)
             }
@@ -250,6 +384,22 @@ fn print_installed_printers() {
         }
         Err(error) => println!("  {error}"),
     }
+}
+
+fn print_jobs(queue: Option<&str>) -> Result<(), String> {
+    let jobs = list_jobs(&SystemRunner, queue)?;
+    if jobs.is_empty() {
+        println!("هیچ کاری در صف نیست.");
+        return Ok(());
+    }
+    println!("کارهای در صف:");
+    for job in jobs {
+        println!(
+            "  - {} | صف: {} | کاربر: {} | اندازه: {} | زمان: {}",
+            job.id, job.queue, job.user, job.size, job.submitted
+        );
+    }
+    Ok(())
 }
 
 fn print_scanners() {
