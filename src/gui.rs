@@ -12,8 +12,8 @@ use crate::backend::packages::{
     aur_helper, enable_services, install_base_packages, install_packages,
 };
 use crate::backend::printers::{
-    add_printer, discover_printers, list_queues, test_print, DiscoveredPrinter, InstalledPrinter,
-    PrinterOrigin, PrinterTransport,
+    discover_printers, list_queues, provision_printer, test_print, DiscoveredPrinter,
+    InstalledPrinter, PrinterOrigin, PrinterTransport,
 };
 use crate::backend::scanners::{default_scan_path, discover_scanners, run_test_scan, Scanner};
 use crate::backend::shell::SystemRunner;
@@ -468,7 +468,7 @@ fn icon_for(state: CheckState) -> &'static str {
 fn build_printer_page(state: &UiState) -> gtk::Widget {
     let (page, content) = titled_page(
         "۲. افزودن چاپگر",
-        "چاپگر USB یا شبکه را انتخاب کنید. برای بیشتر چاپگرهای شبکه درایور خودکار (driverless) کافی است؛ برای USB مدرن بسته ipp-usb را نصب کنید.",
+        "چاپگر را انتخاب کنید. برنامه خودش روش مناسب را تشخیص می‌دهد: driverless برای دستگاه‌های IPP، و نصب خودکار بسته درایور رسمی و انتخاب مدل برای چاپگرهای USB و قدیمی‌تر.",
     );
 
     let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -522,15 +522,15 @@ fn build_printer_page(state: &UiState) -> gtk::Widget {
         .hexpand(true)
         .placeholder_text("مثلاً hp-officejet")
         .build();
-    let driverless = gtk::CheckButton::with_label("درایور خودکار (driverless) — پیشنهادی");
+    let driverless = gtk::CheckButton::with_label("تشخیص و نصب خودکار درایور — پیشنهادی");
     driverless.set_active(true);
     let model_label = gtk::Label::builder()
-        .label("مدل درایور:")
+        .label("مدل دستی (اختیاری):")
         .halign(gtk::Align::Start)
         .build();
     let model_entry = gtk::Entry::builder()
         .hexpand(true)
-        .placeholder_text("خروجی lpinfo -m (فقط حالت دستی)")
+        .placeholder_text("خالی بگذارید تا برنامه خودکار انتخاب کند")
         .build();
     model_entry.set_sensitive(false);
     {
@@ -546,8 +546,17 @@ fn build_printer_page(state: &UiState) -> gtk::Widget {
     form.attach(&model_entry, 1, 2, 2, 1);
     content.append(&form);
 
+    let auto_hint = gtk::Label::new(Some(
+        "در صورت نیاز، بسته رسمی درایور (مانند hplip) با تأیید polkit نصب می‌شود و بهترین مدل PPD خودکار انتخاب می‌گردد. برای انتخاب دستی PPD، تیک تشخیص خودکار را بردارید.",
+    ));
+    auto_hint.set_halign(gtk::Align::Start);
+    auto_hint.set_wrap(true);
+    auto_hint.add_css_class("caption");
+    auto_hint.add_css_class("dim-label");
+    content.append(&auto_hint);
+
     let action_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let add_button = gtk::Button::with_label("افزودن چاپگر");
+    let add_button = gtk::Button::with_label("افزودن خودکار چاپگر");
     let test_button = gtk::Button::with_label("چاپ آزمایشی");
     action_row.append(&add_button);
     action_row.append(&test_button);
@@ -636,8 +645,6 @@ fn build_printer_page(state: &UiState) -> gtk::Widget {
     {
         let state = state.clone();
         let name_entry = name_entry.clone();
-        let model_entry = model_entry.clone();
-        let driverless = driverless.clone();
         let recommendation = recommendation.clone();
         printer_list.connect_row_selected(move |_, row| {
             if let Some(row) = row {
@@ -648,21 +655,21 @@ fn build_printer_page(state: &UiState) -> gtk::Widget {
                 state.selected_printer.set(Some(index));
                 if let Some(printer) = state.printers.borrow().get(index) {
                     name_entry.set_text(&printer.queue_name);
-                    driverless.set_active(printer.driverless);
-                    model_entry.set_sensitive(!printer.driverless);
                     if printer.driverless {
                         recommendation.set_text(&format!(
-                            "درایور خودکار (IPP Everywhere) استفاده می‌شود. · {}",
+                            "این دستگاه IPP است و با درایور خودکار (IPP Everywhere) اضافه می‌شود. · {}",
                             printer.uri
                         ));
-                    } else if let Some(suggestion) = recommend_print_package(&printer.detail) {
+                    } else if let Some(suggestion) =
+                        recommend_print_package(&format!("{} {}", printer.name, printer.detail))
+                    {
                         recommendation.set_text(&format!(
-                            "بسته پیشنهادی: {} ({}). · {}",
-                            suggestion.package, suggestion.reason, printer.uri
+                            "برنامه بسته «{}» را در صورت نیاز نصب می‌کند و مدل را خودکار از lpinfo -m انتخاب می‌کند. · {}",
+                            suggestion.package, printer.uri
                         ));
                     } else {
                         recommendation.set_text(&format!(
-                            "درایور پیشنهادی پیدا نشد؛ مدل را از lpinfo -m وارد کنید. · {}",
+                            "برنامه مدل را خودکار از lpinfo -m پیدا می‌کند؛ اگر پیدا نشد، مدل را دستی وارد کنید. · {}",
                             printer.uri
                         ));
                     }
@@ -701,12 +708,12 @@ fn build_printer_page(state: &UiState) -> gtk::Widget {
             };
             let queue = name_entry.text().trim().to_string();
             let manual_model = model_entry.text().trim().to_string();
-            let model: Option<String> = if driverless.is_active() {
+            let model = if driverless.is_active() {
                 None
             } else if manual_model.is_empty() {
                 set_status(
                     &status,
-                    "برای حالت دستی، مدل درایور را وارد کنید.",
+                    "برای حالت دستی، مدل درایور را وارد کنید یا تشخیص خودکار را فعال کنید.",
                     Some("warning"),
                 );
                 return;
@@ -715,28 +722,49 @@ fn build_printer_page(state: &UiState) -> gtk::Widget {
             };
 
             add_widget.set_sensitive(false);
-            set_status(&status, "در حال افزودن چاپگر...", None);
+            set_status(&status, "در حال تشخیص درایور و افزودن چاپگر...", None);
 
             let queue_message = queue.clone();
+            let printer_name = printer.name.clone();
             let uri = printer.uri;
             let installed_list = installed_list.clone();
             let status = status.clone();
             let add_widget = add_widget.clone();
             run_background(
                 move || {
-                    let result =
-                        add_printer(&SystemRunner, &queue, &uri, model.as_deref(), true, true);
+                    let result = provision_printer(
+                        &SystemRunner,
+                        &queue,
+                        &uri,
+                        &printer_name,
+                        model.as_deref(),
+                        true,
+                        true,
+                    );
                     let queues = list_queues(&SystemRunner);
                     (result, queues)
                 },
                 move |(result, queues)| {
                     render_installed(&installed_list, &status, queues);
                     match result {
-                        Ok(_) => set_status(
-                            &status,
-                            &format!("چاپگر «{queue_message}» اضافه و پیش‌فرض شد."),
-                            Some("success"),
-                        ),
+                        Ok(result) => {
+                            let packages = if result.installed_packages.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    " بسته‌های نصب‌شده: {}.",
+                                    result.installed_packages.join(", ")
+                                )
+                            };
+                            set_status(
+                                &status,
+                                &format!(
+                                    "چاپگر «{queue_message}» اضافه و پیش‌فرض شد (درایور: {}).{packages}",
+                                    result.model
+                                ),
+                                Some("success"),
+                            );
+                        }
                         Err(error) => set_status(&status, &error, Some("error")),
                     }
                     add_widget.set_sensitive(true);

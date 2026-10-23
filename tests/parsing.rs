@@ -4,7 +4,8 @@ use linuprint::backend::avahi::parse_avahi;
 use linuprint::backend::diagnostics::nsswitch_has_mdns;
 use linuprint::backend::drivers::{recommend_print_package, recommend_scanner_package};
 use linuprint::backend::printers::{
-    friendly_name_from_uri, parse_lpinfo, parse_lpstat, suggest_queue_name, validate_queue_name,
+    friendly_name_from_uri, parse_lpinfo, parse_lpinfo_models, parse_lpstat, select_model,
+    suggest_queue_name, uri_supports_driverless, validate_queue_name,
 };
 use linuprint::backend::scanners::parse_scanimage;
 
@@ -102,6 +103,33 @@ fn builds_safe_queue_names() {
     assert!(validate_queue_name("-bad").is_err());
     assert!(validate_queue_name("bad/name").is_err());
     assert!(validate_queue_name("").is_err());
+}
+
+#[test]
+fn selects_exact_model_from_lpinfo_catalog() {
+    let output = "\
+everywhere IPP Everywhere
+raw Raw Queue
+drv:///hp/hpcups.drv/hp-laserjet_1300_series.ppd HP LaserJet 1300 Series, hpcups 3.26.6
+drv:///hp/hpcups.drv/hp-laserjet_1320_series-pcl3.ppd HP LaserJet 1320 Series pcl3, hpcups 3.26.6
+drv:///hp/hpcups.drv/hp-laserjet_1320n.ppd HP LaserJet 1320n, hpcups 3.26.6
+drv:///hp/hpcups.drv/hp-laserjet_1320.ppd HP LaserJet 1320, hpcups 3.26.6
+lsb/usr/HP/hp-laserjet_1320_series-ps.ppd.gz HP LaserJet 1320 series Postscript
+";
+    let models = parse_lpinfo_models(output);
+    assert_eq!(models.len(), 5);
+    let selected = select_model(
+        &models,
+        "HP LaserJet 1320 series",
+        "usb://HP/LaserJet%201320%20series?serial=00CNGW53YHLB",
+    )
+    .unwrap();
+    assert_eq!(selected.model, "drv:///hp/hpcups.drv/hp-laserjet_1320.ppd");
+    assert!(uri_supports_driverless("ipps://printer.local/ipp/print"));
+    assert!(uri_supports_driverless("dnssd://Printer._ipp._tcp.local/"));
+    assert!(!uri_supports_driverless(
+        "usb://HP/LaserJet%201320%20series"
+    ));
 }
 
 #[test]

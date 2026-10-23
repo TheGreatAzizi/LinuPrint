@@ -1,6 +1,6 @@
 [package]
 name = "linuprint"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.92"
 description = "Printer and scanner setup wizard for Arch-based Linux"

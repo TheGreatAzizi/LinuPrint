@@ -1,4 +1,8 @@
+use std::collections::BTreeSet;
+
 use crate::backend::avahi::parse_avahi;
+use crate::backend::drivers::recommend_print_package;
+use crate::backend::packages::{install_packages, package_installed};
 use crate::backend::shell::{describe_failure, run_privileged, Cmd, Runner};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +40,359 @@ pub struct InstalledPrinter {
     pub name: String,
     pub state: String,
     pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrinterModel {
+    pub model: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionResult {
+    pub model: String,
+    pub installed_packages: Vec<String>,
+    pub log: Vec<String>,
+}
+
+pub fn uri_supports_driverless(uri: &str) -> bool {
+    let uri = uri.trim().to_ascii_lowercase();
+    uri.starts_with("ipp://") || uri.starts_with("ipps://") || uri.starts_with("dnssd://")
+}
+
+pub fn parse_lpinfo_models(output: &str) -> Vec<PrinterModel> {
+    let mut models: Vec<PrinterModel> = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (model, description) =
+            match line.split_once(|character: char| character.is_whitespace()) {
+                Some((model, description)) => (model.trim(), description.trim()),
+                None => (line, ""),
+            };
+        if model.is_empty() || model == "everywhere" || model == "raw" {
+            continue;
+        }
+        if models.iter().any(|entry| entry.model == model) {
+            continue;
+        }
+        models.push(PrinterModel {
+            model: model.to_string(),
+            description: description.to_string(),
+        });
+    }
+    models
+}
+
+const GENERIC_TOKENS: &[&str] = &[
+    "hp",
+    "hewlett",
+    "packard",
+    "printer",
+    "printers",
+    "series",
+    "driver",
+    "drivers",
+    "cups",
+    "hpcups",
+    "hplip",
+    "drv",
+    "ppd",
+    "lsb",
+    "usr",
+    "share",
+    "everywhere",
+    "raw",
+    "pdf",
+    "postscript",
+    "ps",
+    "pcl",
+    "pcl5",
+    "pcl6",
+    "zjs",
+    "escpr",
+    "brlaser",
+    "gutenprint",
+    "foomatic",
+    "db",
+    "the",
+    "for",
+    "and",
+    "with",
+    "inc",
+    "ltd",
+    "co",
+    "corp",
+    "corporation",
+];
+
+fn normalized_tokens(text: &str) -> BTreeSet<String> {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 2)
+        .map(str::to_ascii_lowercase)
+        .filter(|token| !GENERIC_TOKENS.contains(&token.as_str()))
+        .collect()
+}
+
+fn number_tokens(text: &str) -> BTreeSet<String> {
+    let mut numbers = BTreeSet::new();
+    let mut current = String::new();
+    for character in text.chars() {
+        if character.is_ascii_digit() {
+            current.push(character);
+        } else {
+            if current.len() >= 3 {
+                numbers.insert(current.clone());
+            }
+            current.clear();
+        }
+    }
+    if current.len() >= 3 {
+        numbers.insert(current);
+    }
+    numbers
+}
+
+fn vendor_from_text(text: &str) -> Option<&'static str> {
+    for token in text
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+    {
+        let vendor = match token {
+            "hp" | "hewlett" | "packard" => "hp",
+            "epson" => "epson",
+            "brother" => "brother",
+            "canon" => "canon",
+            "lexmark" => "lexmark",
+            "xerox" => "xerox",
+            "samsung" => "samsung",
+            "ricoh" => "ricoh",
+            "kyocera" => "kyocera",
+            "dell" => "dell",
+            _ => continue,
+        };
+        return Some(vendor);
+    }
+    None
+}
+
+fn candidate_matches_vendor(vendor: &str, text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    match vendor {
+        "hp" => {
+            text.contains("hp")
+                || text.contains("hewlett")
+                || text.contains("hpcups")
+                || text.contains("hplip")
+        }
+        _ => text.contains(vendor),
+    }
+}
+
+pub fn select_model(
+    models: &[PrinterModel],
+    printer_name: &str,
+    uri: &str,
+) -> Option<PrinterModel> {
+    let printer_text = format!("{printer_name} {}", percent_decode(uri));
+    let printer_tokens = normalized_tokens(&printer_text);
+    let printer_numbers = number_tokens(printer_name);
+    let vendor = vendor_from_text(&printer_text);
+    let mut best: Option<(i32, PrinterModel)> = None;
+
+    for model in models {
+        let candidate_text = format!("{} {}", model.model, model.description);
+        if let Some(vendor) = vendor {
+            if !candidate_matches_vendor(vendor, &candidate_text) {
+                continue;
+            }
+        }
+
+        let mut candidate_numbers = number_tokens(&model.model);
+        let description_head = model.description.split(',').next().unwrap_or("");
+        candidate_numbers.extend(number_tokens(description_head));
+
+        if !printer_numbers.is_empty()
+            && !candidate_numbers.is_empty()
+            && printer_numbers.is_disjoint(&candidate_numbers)
+        {
+            continue;
+        }
+
+        let candidate_tokens = normalized_tokens(&candidate_text);
+        let mut score = 0;
+        for token in &printer_tokens {
+            if candidate_tokens.contains(token) {
+                score += 10;
+            }
+        }
+        for number in &printer_numbers {
+            if candidate_numbers.contains(number) {
+                score += 100;
+            }
+        }
+        if score == 0 {
+            continue;
+        }
+
+        let description_tokens = normalized_tokens(description_head);
+        let extra_tokens = description_tokens
+            .iter()
+            .filter(|token| !printer_tokens.contains(*token))
+            .count() as i32;
+        score -= extra_tokens * 5;
+
+        let lower = candidate_text.to_ascii_lowercase();
+        if lower.contains("hpcups")
+            || lower.contains("hplip")
+            || lower.contains("escpr")
+            || lower.contains("brlaser")
+            || lower.contains("gutenprint")
+        {
+            score += 5;
+        }
+        if model.model.starts_with("drv:///") {
+            score += 2;
+        }
+
+        let better = match &best {
+            Some((best_score, _)) => score > *best_score,
+            None => true,
+        };
+        if better {
+            best = Some((score, model.clone()));
+        }
+    }
+
+    best.map(|(_, model)| model)
+}
+
+pub fn provision_printer(
+    runner: &dyn Runner,
+    queue: &str,
+    uri: &str,
+    printer_name: &str,
+    explicit_model: Option<&str>,
+    make_default: bool,
+    prefer_pkexec: bool,
+) -> Result<ProvisionResult, String> {
+    validate_queue_name(queue)?;
+
+    if let Some(model) = explicit_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        if model.starts_with('-') {
+            return Err("مدل درایور نامعتبر است.".into());
+        }
+        let log = add_printer(runner, queue, uri, Some(model), make_default, prefer_pkexec)?;
+        return Ok(ProvisionResult {
+            model: model.to_string(),
+            installed_packages: Vec::new(),
+            log,
+        });
+    }
+
+    let mut log = Vec::new();
+    if uri_supports_driverless(uri) {
+        match add_printer(runner, queue, uri, None, make_default, prefer_pkexec) {
+            Ok(mut lines) => {
+                log.append(&mut lines);
+                return Ok(ProvisionResult {
+                    model: "everywhere".into(),
+                    installed_packages: Vec::new(),
+                    log,
+                });
+            }
+            Err(error) => log.push(format!("راه‌اندازی driverless ناموفق بود: {error}")),
+        }
+    }
+
+    let printer_text = format!("{printer_name} {}", percent_decode(uri));
+    let mut installed_packages = Vec::new();
+    let mut package_error = None;
+
+    if let Some(recommendation) = recommend_print_package(&printer_text) {
+        if recommendation.official {
+            match package_installed(runner, recommendation.package) {
+                Ok(true) => {}
+                Ok(false) => {
+                    log.push(format!(
+                        "بسته درایور «{}» نصب می‌شود؛ ممکن است چند دقیقه طول بکشد.",
+                        recommendation.package
+                    ));
+                    match install_packages(
+                        runner,
+                        &[recommendation.package.to_string()],
+                        prefer_pkexec,
+                    ) {
+                        Ok(message) => {
+                            log.push(message);
+                            installed_packages.push(recommendation.package.to_string());
+                        }
+                        Err(error) => package_error = Some(error),
+                    }
+                }
+                Err(error) => package_error = Some(error),
+            }
+        } else {
+            package_error = Some(format!(
+                "بسته درایور «{}» در AUR است و به‌صورت خودکار نصب نمی‌شود.",
+                recommendation.package
+            ));
+        }
+    }
+
+    if !runner.exists("lpinfo") {
+        return Err("lpinfo پیدا نشد؛ بسته cups را نصب کنید.".into());
+    }
+    let cmd = Cmd::new("lpinfo").arg("-m");
+    let output = runner
+        .run(&cmd)
+        .map_err(|error| format!("اجرای lpinfo -m ناموفق بود: {error}"))?;
+    if !output.success() && output.stdout.trim().is_empty() {
+        let mut message = describe_failure(&cmd, &output);
+        if let Some(error) = package_error {
+            message.push_str(&format!(" نصب درایور نیز ناموفق بود: {error}"));
+        }
+        return Err(message);
+    }
+
+    let models = parse_lpinfo_models(&output.stdout);
+    let Some(selected) = select_model(&models, printer_name, uri) else {
+        let mut message =
+            "مدل درایور مناسبی برای این چاپگر پیدا نشد. مدل را دستی از خروجی lpinfo -m وارد کنید."
+                .to_string();
+        if let Some(error) = package_error {
+            message.push_str(&format!(" نصب درایور ناموفق بود: {error}"));
+        }
+        return Err(message);
+    };
+
+    if let Some(error) = package_error {
+        log.push(format!("هشدار نصب درایور: {error}"));
+    }
+    let mut added = add_printer(
+        runner,
+        queue,
+        uri,
+        Some(&selected.model),
+        make_default,
+        prefer_pkexec,
+    )?;
+    log.append(&mut added);
+    log.push(format!(
+        "درایور خودکار انتخاب‌شده: {} ({})",
+        selected.model, selected.description
+    ));
+
+    Ok(ProvisionResult {
+        model: selected.model,
+        installed_packages,
+        log,
+    })
 }
 
 pub fn parse_lpinfo(output: &str) -> Vec<DiscoveredPrinter> {

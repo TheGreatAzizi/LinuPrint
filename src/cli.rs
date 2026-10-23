@@ -7,8 +7,8 @@ use crate::backend::diagnostics::{format_report, run_diagnostics, CheckState};
 use crate::backend::drivers::{recommend_print_package, recommend_scanner_package};
 use crate::backend::packages::{enable_services, install_packages};
 use crate::backend::printers::{
-    add_printer, discover_printers, list_queues, remove_printer, test_print, PrinterOrigin,
-    PrinterTransport,
+    discover_printers, friendly_name_from_uri, list_queues, provision_printer, remove_printer,
+    test_print, PrinterOrigin, PrinterTransport,
 };
 use crate::backend::scanners::{discover_scanners, run_test_scan};
 use crate::backend::shell::SystemRunner;
@@ -57,7 +57,7 @@ enum Commands {
 enum PrinterCommands {
     /// فهرست چاپگرهای کشف‌شده و نصب‌شده
     List,
-    /// افزودن چاپگر
+    /// افزودن چاپگر با تشخیص خودکار روش راه‌اندازی و درایور
     Add {
         /// آدرس دستگاه، مثلاً ipp://192.168.1.20/ipp/print یا usb://HP/...
         #[arg(long)]
@@ -65,7 +65,7 @@ enum PrinterCommands {
         /// نام صف در CUPS
         #[arg(long)]
         name: String,
-        /// مدل درایور؛ خالی یعنی driverless (everywhere)
+        /// مدل درایور؛ خالی یعنی انتخاب خودکار (driverless یا نصب درایور سازنده)
         #[arg(long)]
         model: Option<String>,
         /// چاپگر پیش‌فرض نشود
@@ -138,9 +138,22 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
                 model,
                 no_default,
             } => {
-                let log = add_printer(&runner, &name, &uri, model.as_deref(), !no_default, false)?;
-                println!("چاپگر «{name}» اضافه شد.");
-                for line in log {
+                let printer_name = if uri.starts_with("usb://") || uri.starts_with("hp:/") {
+                    friendly_name_from_uri(&uri)
+                } else {
+                    name.clone()
+                };
+                let result = provision_printer(
+                    &runner,
+                    &name,
+                    &uri,
+                    &printer_name,
+                    model.as_deref(),
+                    !no_default,
+                    false,
+                )?;
+                println!("چاپگر «{name}» اضافه شد (درایور: {}).", result.model);
+                for line in result.log {
                     println!("{line}");
                 }
                 println!("برای آزمایش: linuprint printers test {name}");
